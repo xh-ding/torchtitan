@@ -6,3 +6,4 @@
 
 # Import to register quantization modules.
 import torchtitan.components.quantization  # noqa: F401
+import torchtitan.experiments.compat
