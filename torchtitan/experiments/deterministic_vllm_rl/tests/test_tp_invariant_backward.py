@@ -401,6 +401,265 @@ def test_function_directly():
     print("✅ Function directly test passed!")
 
 
+def test_tp_invariant_output():
+    """Test that TPInvariantLinearLayer produces identical outputs across different TP configurations (simulated with matrix chunking)."""
+    print("\n" + "=" * 80)
+    print("Test 9: TP Invariant Output (Different TP configurations)")
+    print("=" * 80)
+
+    if not torch.cuda.is_available():
+        print("❌ CUDA is not available, skipping test")
+        return
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size = 8
+    in_features = 256
+    out_features = 512
+
+    # Create reference weight and bias
+    torch.manual_seed(42)  # For reproducibility
+    weight_full = torch.randn(out_features, in_features, device=device, dtype=dtype)
+    bias_full = torch.randn(out_features, device=device, dtype=dtype)
+    x = torch.randn(batch_size, in_features, device=device, dtype=dtype)
+
+    # Create reference layer with full weight
+    ref_layer = TPInvariantLinearLayer(
+        in_features=in_features,
+        out_features=out_features,
+        bias=True,
+        device=device,
+        dtype=dtype,
+    )
+    with torch.no_grad():
+        ref_layer.weight.copy_(weight_full)
+        ref_layer.bias.copy_(bias_full)
+
+    # Get reference output
+    ref_output = ref_layer(x)
+
+    # Test different TP degrees (simulating column-wise parallelism)
+    tp_degrees = [1, 2, 4, 8]
+    
+    for tp_degree in tp_degrees:
+        if out_features % tp_degree != 0:
+            print(f"⚠️  Skipping TP={tp_degree} (out_features={out_features} not divisible by {tp_degree})")
+            continue
+
+        print(f"\nTesting TP={tp_degree} (Column-wise parallelism simulation)")
+
+        # Split weight and bias along output features (column-wise parallelism)
+        # Each TP rank gets a chunk of out_features
+        out_features_per_rank = out_features // tp_degree
+        tp_outputs = []
+
+        for rank in range(tp_degree):
+            start_idx = rank * out_features_per_rank
+            end_idx = (rank + 1) * out_features_per_rank
+
+            # Get weight chunk for this rank
+            weight_chunk = weight_full[start_idx:end_idx, :]  # Shape: [out_features_per_rank, in_features]
+            bias_chunk = bias_full[start_idx:end_idx]  # Shape: [out_features_per_rank]
+
+            # Create layer for this TP rank
+            tp_layer = TPInvariantLinearLayer(
+                in_features=in_features,
+                out_features=out_features_per_rank,
+                bias=True,
+                device=device,
+                dtype=dtype,
+            )
+            with torch.no_grad():
+                tp_layer.weight.copy_(weight_chunk)
+                tp_layer.bias.copy_(bias_chunk)
+
+            # Forward pass for this rank
+            tp_output = tp_layer(x)  # Shape: [batch_size, out_features_per_rank]
+            tp_outputs.append(tp_output)
+
+        # Concatenate outputs from all TP ranks (simulating all-gather)
+        tp_combined_output = torch.cat(tp_outputs, dim=1)  # Shape: [batch_size, out_features]
+
+        # Compare with reference output
+        max_diff = (tp_combined_output - ref_output).abs().max().item()
+        mean_diff = (tp_combined_output - ref_output).abs().mean().item()
+
+        print(f"  Max difference: {max_diff:.10f}")
+        print(f"  Mean difference: {mean_diff:.10f}")
+
+        # For TP invariant layer, outputs should be strictly identical (or very close due to numerical precision)
+        # Since we're using the same computation, the results should match exactly
+        # However, due to floating point arithmetic order, there might be tiny differences
+        # We use a very strict tolerance (1e-5 for bfloat16)
+        tolerance = 1e-5
+        assert max_diff < tolerance, (
+            f"TP={tp_degree}: Output mismatch! Max diff: {max_diff}, "
+            f"Expected < {tolerance}. This indicates TPInvariantLinearLayer is not TP invariant."
+        )
+
+        # Also verify they are numerically very close (within bfloat16 precision)
+        assert torch.allclose(tp_combined_output, ref_output, atol=tolerance, rtol=tolerance), (
+            f"TP={tp_degree}: Outputs are not close enough. "
+            f"This indicates TPInvariantLinearLayer is not TP invariant."
+        )
+
+        print(f"  ✅ TP={tp_degree} test passed!")
+
+    print("\n✅ TP Invariant Output test passed!")
+
+
+def binary_tree_sum(tensors):
+    """
+    Sum tensors in binary tree order (simulating all-reduce operation).
+    
+    This function performs reduction in a binary tree fashion:
+    - Pairs adjacent tensors and sums them
+    - Repeats until only one tensor remains
+    
+    Example for 4 tensors [a, b, c, d]:
+        Level 1: a+b -> ab, c+d -> cd
+        Level 2: ab+cd -> abcd
+        Result: abcd
+    
+    This simulates the binary tree reduction pattern used in real all-reduce
+    operations, which may have different numerical precision compared to
+    sequential summation.
+    
+    Args:
+        tensors: List of tensors to sum
+        
+    Returns:
+        Sum of all tensors computed in binary tree order
+    """
+    if len(tensors) == 0:
+        raise ValueError("Cannot sum empty list of tensors")
+    if len(tensors) == 1:
+        return tensors[0]
+    
+    # Make a copy to avoid modifying the original list
+    current = list(tensors)
+    
+    # Perform binary tree reduction
+    while len(current) > 1:
+        next_level = []
+        # Pair adjacent tensors and sum them
+        for i in range(0, len(current) - 1, 2):
+            next_level.append(current[i] + current[i + 1])
+        # If odd number of tensors, keep the last one
+        if len(current) % 2 == 1:
+            next_level.append(current[-1])
+        current = next_level
+    
+    return current[0]
+
+
+def test_tp_invariant_output_rowwise():
+    """Test that TPInvariantLinearLayer produces identical outputs with row-wise parallelism simulation."""
+    print("\n" + "=" * 80)
+    print("Test 10: TP Invariant Output (Row-wise parallelism simulation)")
+    print("=" * 80)
+
+    if not torch.cuda.is_available():
+        print("❌ CUDA is not available, skipping test")
+        return
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size = 8
+    in_features = 512
+    out_features = 256
+
+    # Create reference weight and bias
+    torch.manual_seed(43)  # Different seed for this test
+    weight_full = torch.randn(out_features, in_features, device=device, dtype=dtype)
+    bias_full = torch.randn(out_features, device=device, dtype=dtype)
+    x = torch.randn(batch_size, in_features, device=device, dtype=dtype)
+
+    # Create reference layer with full weight
+    ref_layer = TPInvariantLinearLayer(
+        in_features=in_features,
+        out_features=out_features,
+        bias=True,
+        device=device,
+        dtype=dtype,
+    )
+    with torch.no_grad():
+        ref_layer.weight.copy_(weight_full)
+        ref_layer.bias.copy_(bias_full)
+
+    # Get reference output
+    ref_output = ref_layer(x)
+
+    # Test different TP degrees (simulating row-wise parallelism)
+    # In row-wise parallelism, we split the input features (K dimension)
+    tp_degrees = [1, 2, 4, 8]
+
+    for tp_degree in tp_degrees:
+        if in_features % tp_degree != 0:
+            print(f"⚠️  Skipping TP={tp_degree} (in_features={in_features} not divisible by {tp_degree})")
+            continue
+
+        print(f"\nTesting TP={tp_degree} (Row-wise parallelism simulation)")
+
+        # Split weight along input features (row-wise parallelism)
+        # Each TP rank processes a chunk of input features
+        in_features_per_rank = in_features // tp_degree
+        tp_partial_outputs = []
+
+        for rank in range(tp_degree):
+            start_idx = rank * in_features_per_rank
+            end_idx = (rank + 1) * in_features_per_rank
+
+            # Get weight chunk for this rank (all output features, but chunk of input features)
+            weight_chunk = weight_full[:, start_idx:end_idx]  # Shape: [out_features, in_features_per_rank]
+            x_chunk = x[:, start_idx:end_idx]  # Shape: [batch_size, in_features_per_rank]
+
+            # Create layer for this TP rank
+            tp_layer = TPInvariantLinearLayer(
+                in_features=in_features_per_rank,
+                out_features=out_features,
+                bias=False,  # No bias for partial computation in row-wise parallelism
+                device=device,
+                dtype=dtype,
+            )
+            with torch.no_grad():
+                tp_layer.weight.copy_(weight_chunk)
+
+            # Forward pass for this rank (partial computation)
+            tp_partial_output = tp_layer(x_chunk)  # Shape: [batch_size, out_features]
+            tp_partial_outputs.append(tp_partial_output)
+
+        # Sum partial outputs from all TP ranks (simulating all-reduce)
+        # Use binary tree order summation to simulate realistic all-reduce operation
+        tp_combined_output = binary_tree_sum(tp_partial_outputs)  # Shape: [batch_size, out_features]
+
+        # Add bias (bias is replicated, so we add it once)
+        tp_combined_output = tp_combined_output + bias_full
+
+        # Compare with reference output
+        max_diff = (tp_combined_output - ref_output).abs().max().item()
+        mean_diff = (tp_combined_output - ref_output).abs().mean().item()
+
+        print(f"  Max difference: {max_diff:.10f}")
+        print(f"  Mean difference: {mean_diff:.10f}")
+
+        # Verify outputs are strictly identical (or very close)
+        tolerance = 1e-5
+        assert max_diff < tolerance, (
+            f"TP={tp_degree}: Output mismatch! Max diff: {max_diff}, "
+            f"Expected < {tolerance}. This indicates TPInvariantLinearLayer is not TP invariant."
+        )
+
+        assert torch.allclose(tp_combined_output, ref_output, atol=tolerance, rtol=tolerance), (
+            f"TP={tp_degree}: Outputs are not close enough. "
+            f"This indicates TPInvariantLinearLayer is not TP invariant."
+        )
+
+        print(f"  ✅ TP={tp_degree} test passed!")
+
+    print("\n✅ TP Invariant Output (Row-wise) test passed!")
+
+
 def main():
     """Run all tests."""
     print("=" * 80)
@@ -420,6 +679,8 @@ def main():
         test_different_dtypes()
         test_different_shapes()
         test_function_directly()
+        test_tp_invariant_output()
+        test_tp_invariant_output_rowwise()
 
         print("\n" + "=" * 80)
         print("✅ All tests passed!")
