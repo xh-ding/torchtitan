@@ -194,3 +194,23 @@ class VLLMCompatibleFlashAttention(torch.nn.Module):
         output = output.transpose(1, 2)
 
         return output
+
+
+class VLLMCompatibleTritonAttention(torch.nn.Module):
+    """Wrapper around Triton Attention as used by vLLM"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        pass
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        class TritonAttentionWithBackward(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, q, k, v):
+                pass
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                pass
+
+        pass
