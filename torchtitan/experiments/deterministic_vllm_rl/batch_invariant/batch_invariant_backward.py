@@ -130,10 +130,14 @@ class RMSNormFunction(Function):
         Returns:
             output: Normalized and scaled tensor [*, hidden_size]
         """
-        from vllm.model_executor.layers.batch_invariant import rms_norm as vllm_rms_norm
 
-        # Use vLLM's Triton kernel for forward (deterministic)
-        output = vllm_rms_norm(input, weight, eps)
+        orig_dtype = input.dtype
+        input = input.to(torch.float32)
+        variance = input.pow(2).mean(dim=-1, keepdim=True)
+        input = input * torch.rsqrt(variance + eps)
+        input = input.to(orig_dtype)
+
+        output = input * weight
 
         # Save for backward
         ctx.save_for_backward(input, weight)
