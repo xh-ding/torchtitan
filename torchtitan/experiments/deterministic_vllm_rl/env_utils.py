@@ -17,9 +17,10 @@ def vllm_is_tp_invariant():
     val = os.getenv(env_key, "0")
     try:
         is_overridden = int(val) != 0
-        assert vllm_is_batch_invariant(), "Batch invariance must be enabled when TP invariance is enabled"
     except ValueError:
         is_overridden = False
+    if is_overridden:
+        assert vllm_is_batch_invariant(), "Batch invariance must be enabled when TP invariance is enabled"
     return is_overridden
 
 def vllm_check_invariant_compat():
@@ -52,7 +53,8 @@ def vllm_compatible_mode():
     val = os.getenv(key, "0")
     try:
         is_overridden = int(val) != 0
-        assert vllm_check_invariant_compat(), "TP invariance and batch invariance must be enabled under train-inference alignment mode"
     except ValueError:
         is_overridden = False
+    if is_overridden:
+        assert vllm_check_invariant_compat(), "TP invariance and batch invariance must be enabled under train-inference alignment mode"
     return is_overridden
