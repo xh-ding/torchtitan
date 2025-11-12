@@ -23,6 +23,8 @@ from torchtitan.protocols.train_spec import ModelProtocol
 
 # Import from local experiment's models
 from ..attention import VLLMCompatibleFlashAttention, VLLMCompatibleTritonAttention
+from torchtitan.experiments.deterministic_vllm_rl.env_utils import vllm_is_tp_invariant
+from torchtitan.experiments.deterministic_vllm_rl.tp_invariant.module import TPInvariantLinearLayer
 
 
 # RoPE functions (same as original)
@@ -111,12 +113,12 @@ class Attention(nn.Module):
         )
         self.wk = nn.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(
+        self.wo = TPInvariantLinearLayer(model_args.n_heads * self.head_dim, model_args.dim, bias=False) if vllm_is_tp_invariant() else nn.Linear(
             model_args.n_heads * self.head_dim, model_args.dim, bias=False
         )
 
         # Always use vLLM compatible flash attention
-        self.inner_attention = VLLMCompatibleFlashAttention()
+        self.inner_attention = VLLMCompatibleTritonAttention()
 
     def init_weights(self, init_std: float):
         for linear in (self.wq, self.wk, self.wv):
@@ -245,7 +247,7 @@ class Qwen3VLLMCompatModel(nn.Module, ModelProtocol):
             self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args)
 
         self.norm = VLLMRMSNorm(model_args.dim, eps=model_args.norm_eps)
-        self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
+        self.output = TPInvariantLinearLayer(model_args.dim, model_args.vocab_size, bias=False) if vllm_is_tp_invariant() else nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
 
         # IMPORTANT: To match vLLM's behavior and Qwen3's config
         # (tie_word_embeddings: true), tie output layer weights to

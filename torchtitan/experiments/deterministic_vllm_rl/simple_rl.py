@@ -28,7 +28,6 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoConfig, AutoTokenizer
 
 from vllm import LLM, SamplingParams
-from vllm.model_executor.layers.batch_invariant import init_batch_invariance
 
 from torchtitan.experiments.deterministic_vllm_rl.weights.converter import (
     torchtitan_to_vllm,
@@ -40,7 +39,7 @@ from torchtitan.experiments.deterministic_vllm_rl.weights_vllm_compat import (
 
 from torchtitan.models.qwen3.model.args import Qwen3ModelArgs
 
-init_batch_invariance()
+from torchtitan.experiments.deterministic_vllm_rl.env_utils import vllm_check_invariant_compat
 
 
 class VLLMRolloutEngine:
@@ -1025,7 +1024,7 @@ def compute_weight_deltas(model: torch.nn.Module, initial_state: dict) -> dict:
 
 def main():
     """Simple RL training loop using vLLM for fast rollouts."""
-
+    vllm_check_invariant_compat()
     # ========== Config ==========
     model_name = "Qwen/Qwen3-1.7B"  # HuggingFace model name
     cache_dir = "./models"
@@ -1050,7 +1049,7 @@ def main():
     num_dataset_samples = 10  # Number of prompts from dataset
 
     # Check if batch invariance is enabled
-    from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
+    from torchtitan.experiments.deterministic_vllm_rl.env_utils import vllm_is_batch_invariant
 
     use_vllm_compat = vllm_is_batch_invariant()
 
@@ -1058,7 +1057,7 @@ def main():
         print("✓ Batch invariance detected - using vLLM-compatible model")
         # Add backward pass support to vLLM's batch_invariant mode
         print("  Adding gradient support to vLLM's batch_invariant mode...")
-        from torchtitan.experiments.deterministic_vllm_rl.batch_invariant_backward import (
+        from torchtitan.experiments.deterministic_vllm_rl.batch_invariant import (
             enable_batch_invariant_backward_mode,
         )
 

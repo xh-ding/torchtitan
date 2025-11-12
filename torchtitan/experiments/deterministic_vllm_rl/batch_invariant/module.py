@@ -1,9 +1,11 @@
 import torch
-from torch.nn import nn
+from torch import nn
 from torchtitan.experiments.deterministic_vllm_rl.batch_invariant.batch_invariant_backward import (
     RMSNormFunction,
     SiluAndMulFunction,
 )
+from torchtitan.experiments.deterministic_vllm_rl.env_utils import vllm_is_tp_invariant
+from torchtitan.experiments.deterministic_vllm_rl.tp_invariant.module import TPInvariantLinearLayer
 
 class VLLMRMSNorm(nn.Module):
     """
@@ -44,7 +46,7 @@ class FeedForwardVLLMCompat(nn.Module):
         self.gate_up_proj = nn.Linear(dim, hidden_dim * 2, bias=False)
 
         # Down projection (like vLLM's down_proj)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
+        self.down_proj = TPInvariantLinearLayer(hidden_dim, dim, bias=False) if vllm_is_tp_invariant() else nn.Linear(hidden_dim, dim, bias=False)
 
     def forward(self, x):
         # Project to gate and up in one go

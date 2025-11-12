@@ -17,18 +17,14 @@ Key components:
 - simple_rl: End-to-end RL training loop
 """
 
-from .batch_invariant_backward import (
-    enable_batch_invariant_backward_mode,
-    rms_norm_with_gradients,
-    silu_and_mul_with_gradients,
-)
-from .models import VLLMCompatibleFlashAttention
+
+
 from .models.qwen3 import Qwen3VLLMCompatModel
+from .env_utils import vllm_compatible_mode, vllm_is_batch_invariant, vllm_is_tp_invariant
 
 __all__ = [
-    "VLLMCompatibleFlashAttention",
     "Qwen3VLLMCompatModel",
-    "enable_batch_invariant_backward_mode",
-    "rms_norm_with_gradients",
-    "silu_and_mul_with_gradients",
+    "vllm_compatible_mode",
+    "vllm_is_batch_invariant",
+    "vllm_is_tp_invariant",
 ]
