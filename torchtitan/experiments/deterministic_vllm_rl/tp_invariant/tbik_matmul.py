@@ -7,7 +7,7 @@ import math
 
 
 def _matmul_launch_metadata(
-    grid: Callable[..., Any], kernel: Any, args: Dict[str, Any]
+        grid: Callable[..., Any], kernel: Any, args: Dict[str, Any]
 ) -> Dict[str, Any]:
     ret = {}
     m, n, k = args["M"], args["N"], args["K"]
@@ -24,106 +24,16 @@ def _matmul_launch_metadata(
     ret["bytes"] = bytes_per_elem * (m * k + n * k + m * n)
     return ret
 
-# ---- kernel ----
-@triton.jit(launch_metadata=_matmul_launch_metadata)
-def matmul_kernel_tp_persistent(
-    A_ptr, B_ptr, C_ptr,
-    Scratch_ptr, Table_ptr, Count_ptr,
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    stride_sg, stride_si, stride_sm, stride_sn,   # scratch strides
-    stride_tg, stride_ti,
-    stride_cg, stride_ci,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    LEVEL_K: tl.constexpr,                        # = log2(TILE_K)
-    TILE_K: tl.constexpr,                         # = K//BLOCK_K
-    GRID_N: tl.constexpr,
-    ACC_DTYPE: tl.constexpr,
-    OUT_DTYPE: tl.constexpr,
-    A_LARGE: tl.constexpr,
-    B_LARGE: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    if A_LARGE:
-        offs_m = offs_m.to(tl.int64)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    if B_LARGE:
-        offs_n = offs_n.to(tl.int64)
-    offs_k = tl.arange(0, BLOCK_K)
-    mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+@triton.jit
+def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
+    group_id = tile_id // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (tile_id % group_size_m)
+    pid_n = (tile_id % num_pid_in_group) // group_size_m
+    return pid_m, pid_n
 
-    row = tl.arange(0, BLOCK_M)
-    col = tl.arange(0, BLOCK_N)
-
-    if A_LARGE or B_LARGE:
-        row = row.to(tl.int64)
-        col = col.to(tl.int64)
-
-    scratch_base = Scratch_ptr + (pid_m*GRID_N+pid_n)*stride_sg
-    table_base = Table_ptr + (pid_m*GRID_N +pid_n)*stride_tg
-    count_base = Count_ptr + (pid_m*GRID_N +pid_n)*stride_cg
-
-    mask_tile = (row[:, None] < BLOCK_M) & (col[None, :] < BLOCK_N)
-
-    for s_tile_idx in range(0, TILE_K):
-        k0 = s_tile_idx * BLOCK_K
-        # 这里如果用和Scratch不匹配的精度就 还会有误差 不知道为什么
-        acc = tl.zeros((BLOCK_M,BLOCK_N), dtype=ACC_DTYPE)
-        a = tl.load(
-            A_ptr + (offs_m[:, None] * stride_am + (k0 + offs_k)[None, :] * stride_ak),
-            mask=(offs_m[:, None] < M) & ((k0 + offs_k)[None, :] < K),
-            other=0.0,
-        )
-        b = tl.load(
-            B_ptr + ((k0 + offs_k)[:, None] * stride_bk + offs_n[None, :] * stride_bn),
-            mask=((k0 + offs_k)[:, None] < K) & (offs_n[None, :] < N),
-            other=0.0,
-        )
-
-        acc = acc + tl.dot(a, b).to(ACC_DTYPE)
-
-        break_flag = 0
-        level = 0
-        while level < LEVEL_K and break_flag == 0:
-            # count最低位+1
-            table_level_ptr = table_base+level*stride_ti
-            count_level_ptr = count_base+level*stride_ci
-
-            count_value = tl.load(count_level_ptr)
-
-            table_value = tl.load(table_level_ptr)
-
-            carry_over = (table_value == (count_value+1)).to(tl.int1)
-
-            tmp_acc_ptr = scratch_base + level * stride_si + (
-                row[:, None] * stride_sm + col[None, :] * stride_sn
-            )
-
-            tmp_acc = tl.load(tmp_acc_ptr).to(ACC_DTYPE)
-            acc = tmp_acc + acc
-
-            # 进位了
-            if carry_over:
-                count_value = 0
-                tl.store(tmp_acc_ptr, tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32), mask=mask_tile)
-            else:
-                count_value += 1
-                break_flag = 1
-                tl.store(tmp_acc_ptr, acc, mask=mask_tile)
-            tl.store(count_level_ptr, count_value)
-
-            level += 1
-        # 完成reduce了 此时的break_flag应该为0 同时level == LEVEL_K
-        if s_tile_idx == TILE_K - 1:
-            c_ptr = C_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
-            tl.store(c_ptr, acc.to(OUT_DTYPE), mask=mask_c)
 
 def _get_tl_dtype(dtype):
     if dtype == torch.float32:
@@ -133,50 +43,190 @@ def _get_tl_dtype(dtype):
     elif dtype == torch.bfloat16:
         return tl.bfloat16
 
-def matmul_tp_persistent(A: torch.Tensor, B: torch.Tensor, bias: torch.Tensor=None):
+
+# ---- kernel ----
+@triton.jit(launch_metadata=_matmul_launch_metadata)
+def matmul_kernel_tp_persistent(
+        A_ptr, B_ptr, C_ptr,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        GROUP_SIZE_M: tl.constexpr,
+        NUM_SMS: tl.constexpr,
+        LEVEL_K: tl.constexpr,  # = log2(TILE_K)
+        TILE_K: tl.constexpr,  # = K//BLOCK_K
+        FIRST_LEVEL_BLOCK: tl.constexpr,
+        NEXT_POWER_OF_LEVEL: tl.constexpr,
+        NEXT_POWER_OF_REMAIN_LEVEL: tl.constexpr,
+        ACC_DTYPE: tl.constexpr,
+        OUT_DTYPE: tl.constexpr,
+        A_LARGE: tl.constexpr,
+        B_LARGE: tl.constexpr,
+        C_LARGE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_tiles = num_pid_m * num_pid_n
+
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    manual_acc = 3
+    acc1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+    acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+    acc3 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+
+    S = tl.zeros((NEXT_POWER_OF_REMAIN_LEVEL, BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+
+    S_mask = tl.arange(0, NEXT_POWER_OF_REMAIN_LEVEL)[:, None, None]
+
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_k = tl.max_contiguous(tl.multiple_of(offs_k, BLOCK_K), BLOCK_K)
+
+    for tile_id in tl.range(pid, num_tiles, NUM_SMS, flatten=False):
+        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+
+        start_m = pid_m * BLOCK_M
+        start_n = pid_n * BLOCK_N
+
+        offs_am = start_m + tl.arange(0, BLOCK_M)
+        if A_LARGE:
+            offs_am = offs_am.to(tl.int64)
+        offs_am = tl.where(offs_am < M, offs_am, 0)
+
+        offs_bn = start_n + tl.arange(0, BLOCK_N)
+        if B_LARGE:
+            offs_bn = offs_bn.to(tl.int64)
+        offs_bn = tl.where(offs_bn < N, offs_bn, 0)
+
+        offs_am = tl.max_contiguous(tl.multiple_of(offs_am, BLOCK_M), BLOCK_M)
+        offs_bn = tl.max_contiguous(tl.multiple_of(offs_bn, BLOCK_N), BLOCK_N)
+
+        a_ptrs = A_ptr + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
+        b_ptrs = B_ptr + offs_bn[None, :] * stride_bn + offs_k[:, None] * stride_bk
+
+        count = tl.zeros((NEXT_POWER_OF_LEVEL,), dtype=tl.int32)
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+        for s_tile_idx in range(0, TILE_K):
+            k0 = s_tile_idx * BLOCK_K
+            a = tl.load(
+                a_ptrs,
+                mask=(offs_am[:, None] < M) & ((k0 + offs_k)[None, :] < K),
+                other=0.0,
+            )
+            b = tl.load(
+                b_ptrs,
+                mask=((k0 + offs_k)[:, None] < K) & (offs_bn[None, :] < N),
+                other=0.0,
+            )
+            a_ptrs += BLOCK_K * stride_ak
+            b_ptrs += BLOCK_K * stride_bk
+
+            acc = tl.dot(a, b).to(ACC_DTYPE)
+
+            break_flag = 0
+            for level in range(LEVEL_K):
+                if break_flag == 0:
+                    idx_mask = tl.arange(0, NEXT_POWER_OF_LEVEL) == level
+
+                    count_value_added = tl.sum(count * idx_mask) + 1
+
+                    table_value = FIRST_LEVEL_BLOCK if level == 0 else 2
+
+                    carry_over = (table_value == count_value_added).to(tl.int1)
+
+                    if count_value_added > 1:
+                        if level == 0:
+                            acc = acc1 + acc
+                        elif level == 1:
+                            acc = acc2 + acc
+                        elif level == 2:
+                            acc = acc3 + acc
+                        else:
+                            tmp_acc_mask = (S_mask == (level - manual_acc))
+                            acc = tl.sum(S * tmp_acc_mask, axis=0, dtype=ACC_DTYPE) + acc
+
+                    count = tl.where(idx_mask, count_value_added * (1 - carry_over), count)
+                    if not carry_over:
+                        break_flag = 1
+                        if level == 0:
+                            acc1 = acc
+                        elif level == 1:
+                            acc2 = acc
+                        elif level == 2:
+                            acc3 = acc
+                        else:
+                            tmp_acc_mask = (S_mask == (level - manual_acc))
+                            S = tl.where(tmp_acc_mask, acc[None, :, :], S)
+
+        c_ptr = C_ptr + (offs_am[:, None] * stride_cm + offs_bn[None, :] * stride_cn)
+        offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        if C_LARGE:
+            offs_cm = offs_cm.to(tl.int64)
+            offs_cn = offs_cn.to(tl.int64)
+        offs_cm = tl.where(offs_cm < M, offs_cm, 0)
+        offs_cn = tl.where(offs_cn < N, offs_cn, 0)
+        offs_cm = tl.max_contiguous(tl.multiple_of(offs_cm, BLOCK_M), BLOCK_M)
+        offs_cn = tl.max_contiguous(tl.multiple_of(offs_cn, BLOCK_N), BLOCK_N)
+        mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        tl.store(c_ptr, acc.to(OUT_DTYPE), mask=mask_c)
+
+
+def matmul_tp_persistent(A: torch.Tensor, B: torch.Tensor, bias: torch.Tensor = None):
     assert A.shape[-1] == B.shape[-2], "Dim doesn't match"
 
     out_dtype = A.dtype
     acc_dtype = A.dtype
 
+    NUM_SMS = torch.cuda.get_device_properties(A.device).multi_processor_count
+
+    # 1D launch kernel where each block gets its own program.
+    def grid(META):
+        return (
+            min(
+                NUM_SMS, triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"])
+            ),
+        )
+
     configs = {
         torch.bfloat16: {
-            # "BLOCK_SIZE_M": 64,
-            # "BLOCK_SIZE_N": 64,
-            # "BLOCK_SIZE_K": 128,
-            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 64,
+            "BLOCK_SIZE_K": 256,
+            "GROUP_SIZE_M": 8,
             "num_stages": 2,
-            "num_warps": 4,
+            "num_warps": 8,
         },
         torch.float16: {
-            # "BLOCK_SIZE_M": 64,
-            # "BLOCK_SIZE_N": 64,
-            # "BLOCK_SIZE_K": 128,
-            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 64,
+            "BLOCK_SIZE_K": 256,
+            "GROUP_SIZE_M": 8,
             "num_stages": 2,
-            "num_warps": 4,
+            "num_warps": 8,
         },
         torch.float32: {
-            # "BLOCK_SIZE_M": 32,
-            # "BLOCK_SIZE_N": 32,
-            # "BLOCK_SIZE_K": 128,
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 32,
-            "num_stages": 2,
-            "num_warps": 4,
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 8,
+            "num_stages": 3,
+            "num_warps": 8,
         },
     }
 
-    BLOCK_M=configs[out_dtype]["BLOCK_SIZE_M"]
-    BLOCK_N=configs[out_dtype]["BLOCK_SIZE_N"]
-    BLOCK_K=configs[out_dtype]["BLOCK_SIZE_K"]
-    num_stages=configs[out_dtype]["num_stages"]
-    num_warps=configs[out_dtype]["num_warps"]
+    BLOCK_M = configs[out_dtype]["BLOCK_SIZE_M"]
+    BLOCK_N = configs[out_dtype]["BLOCK_SIZE_N"]
+    BLOCK_K = configs[out_dtype]["BLOCK_SIZE_K"]
+    GROUP_SIZE_M = configs[out_dtype]["GROUP_SIZE_M"]
+    num_stages = configs[out_dtype]["num_stages"]
+    num_warps = configs[out_dtype]["num_warps"]
 
     M, K = A.shape
     _, N = B.shape
@@ -185,38 +235,30 @@ def matmul_tp_persistent(A: torch.Tensor, B: torch.Tensor, bias: torch.Tensor=No
     FIRST_LEVEL_BLOCK = T
 
     LEVEL_K = 1
-    while FIRST_LEVEL_BLOCK>2 and FIRST_LEVEL_BLOCK %2 == 0:
+    while FIRST_LEVEL_BLOCK > 2 and FIRST_LEVEL_BLOCK % 2 == 0:
         FIRST_LEVEL_BLOCK //= 2
         LEVEL_K += 1
 
     C = torch.empty((M, N), device=A.device, dtype=out_dtype)
 
-    grid_m = triton.cdiv(M, BLOCK_M)
-    grid_n = triton.cdiv(N, BLOCK_N)
-    grid = (grid_m, grid_n)
+    manual_acc = 3
 
-    # Scratch 用累加精度存储
-    Scratch = torch.zeros(grid_m * grid_n, LEVEL_K, BLOCK_M, BLOCK_N,
-                        device=A.device, dtype=acc_dtype)
-
-    Table = torch.full((grid_m * grid_n, LEVEL_K), 2, device=A.device, dtype=torch.int32)
-    Table[:, 0] = FIRST_LEVEL_BLOCK
-    Count = torch.zeros((grid_m * grid_n, LEVEL_K), device=A.device, dtype=torch.int32)
-
-    assert Table[0, :].prod() == T
+    NEXT_POWER_OF_LEVEL = 2 ** math.ceil(math.log2(LEVEL_K))
+    # set minimum value of 1
+    NEXT_POWER_OF_REMAIN_LEVEL = 2 ** math.ceil(math.log2(LEVEL_K - manual_acc)) if LEVEL_K > manual_acc else 1
 
     matmul_kernel_tp_persistent[grid](
         A, B, C,
-        Scratch, Table, Count,
         M, N, K,
         *A.stride(), *B.stride(), *C.stride(),
-        *Scratch.stride(), *Table.stride(), *Count.stride(),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        LEVEL_K=LEVEL_K, TILE_K=T,GRID_N=grid_n,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, GROUP_SIZE_M=GROUP_SIZE_M, NUM_SMS=NUM_SMS,
+        NEXT_POWER_OF_REMAIN_LEVEL=NEXT_POWER_OF_REMAIN_LEVEL,
+        LEVEL_K=LEVEL_K, TILE_K=T, FIRST_LEVEL_BLOCK=FIRST_LEVEL_BLOCK, NEXT_POWER_OF_LEVEL=NEXT_POWER_OF_LEVEL,
         ACC_DTYPE=_get_tl_dtype(acc_dtype),
         OUT_DTYPE=_get_tl_dtype(out_dtype),
-        A_LARGE=A.numel()>2**31,
-        B_LARGE=B.numel()>2**31,
+        A_LARGE=A.numel() > 2 ** 31,
+        B_LARGE=B.numel() > 2 ** 31,
+        C_LARGE=C.numel() > 2 ** 31,
         num_warps=num_warps, num_stages=num_stages
     )
     if bias is not None:

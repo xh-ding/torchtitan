@@ -117,7 +117,7 @@ class Attention(nn.Module):
             model_args.n_heads * self.head_dim, model_args.dim, bias=False
         )
 
-        # Always use vLLM compatible flash attention
+        # Always use vLLM compatible triton attention
         self.inner_attention = VLLMCompatibleTritonAttention()
 
     def init_weights(self, init_std: float):
@@ -157,19 +157,16 @@ class Attention(nn.Module):
         values = repeat_kv(xv, self.n_rep)
 
         # Transpose for attention
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        xk = keys.transpose(1, 2)
-        xv = values.transpose(1, 2)
+        # xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        # xk = keys.transpose(1, 2)
+        # xv = values.transpose(1, 2)
 
-        # Apply flash attention (vLLM compatible, no flex attention)
-        assert (
-            attention_masks is None
-        ), "vLLM compat mode doesn't use flex attention masks"
-        output = self.inner_attention(xq, xk, xv, scale=self.scaling)
-
+        # For triton attention, the input shape should be [B, L, H, D]. So, we don't need to transpose qkv.
+        output = self.inner_attention(xq, xk, xv, attention_mask=attention_masks, scale=self.scaling)
+        # print('attn output', output.shape)
         # Transpose back
-        output = output.transpose(1, 2).contiguous()
-        output = output.view(bs, seqlen, -1)
+        # output = output.transpose(1, 2).contiguous()
+        # output = output.view(bs, seqlen, -1)
 
         return self.wo(output)
 

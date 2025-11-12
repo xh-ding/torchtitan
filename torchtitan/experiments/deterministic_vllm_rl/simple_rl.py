@@ -17,8 +17,11 @@ This demonstrates:
 7. Optional real dataset support (GSM8K math dataset)
 """
 
-import os
+import os, sys
 import re
+
+src_path = os.path.join('/export/scratch_large/zzy/LLMOutputReproducibility', "src")
+sys.path.insert(0, src_path)
 
 import torch
 import torch.nn.functional as F
@@ -26,6 +29,10 @@ from huggingface_hub import snapshot_download
 from safetensors.torch import load_file, save_file
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoConfig, AutoTokenizer
+
+import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision
+import math
 
 from vllm import LLM, SamplingParams
 
@@ -163,10 +170,11 @@ class VLLMRolloutEngine:
         if self.llm is None:
             self.llm = LLM(
                 model=self.temp_model_dir,
-                trust_remote_code=True,
+                trust_remote_code=False,
                 max_model_len=2048,
                 dtype="bfloat16",
                 gpu_memory_utilization=0.3,  # Reduced from 0.5
+                tensor_parallel_size=4,
                 seed=42,  # Fixed seed for determinism
                 enforce_eager=True,
             )
@@ -178,11 +186,11 @@ class VLLMRolloutEngine:
 
     @torch.no_grad()
     def generate(
-        self,
-        prompt_texts: list[str],
-        max_new_tokens: int = 20,
-        temperature: float = 1.0,
-        n_samples_per_prompt: int = 4,
+            self,
+            prompt_texts: list[str],
+            max_new_tokens: int = 20,
+            temperature: float = 1.0,
+            n_samples_per_prompt: int = 4,
     ) -> tuple[
         list[str], torch.Tensor, list[list[int]], list[list[float]], list[list[int]]
     ]:
@@ -263,7 +271,7 @@ class VLLMRolloutEngine:
 
 
 def download_and_convert_model(
-    model_name: str, cache_dir: str = "./models", output_dir: str = "./converted"
+        model_name: str, cache_dir: str = "./models", output_dir: str = "./converted"
 ) -> tuple[str, str]:
     """
     Download model from HuggingFace and convert to TorchTitan format.
@@ -387,9 +395,9 @@ def extract_numeric_answer(text: str) -> str | None:
 
 
 def math_reward_function(
-    completions: list[str],
-    expected_answers: list[str],
-    group_size: int = 4,
+        completions: list[str],
+        expected_answers: list[str],
+        group_size: int = 4,
 ) -> torch.Tensor:
     """
     Reward function for math problems (e.g., GSM8K).
@@ -479,10 +487,10 @@ def load_gsm8k_dataset(split: str = "train", num_samples: int = 100):
 
 
 def trivial_reward_function(
-    completions: list[str],
-    tokenizer=None,
-    expected_answers: list[str] | None = None,
-    group_size: int = 4,
+        completions: list[str],
+        tokenizer=None,
+        expected_answers: list[str] | None = None,
+        group_size: int = 4,
 ) -> torch.Tensor:
     """
     Reward function based on correctness and lowercase preference.
@@ -551,7 +559,7 @@ def trivial_reward_function(
 
 
 def compute_grpo_advantages(
-    rewards: torch.Tensor, group_size: int = 4, beta: float = 0.1
+        rewards: torch.Tensor, group_size: int = 4, beta: float = 0.1
 ) -> torch.Tensor:
     """
     Compute advantages using GRPO-style exponential weighting.
@@ -574,7 +582,7 @@ def compute_grpo_advantages(
     """
     batch_size = rewards.shape[0]
     assert (
-        batch_size % group_size == 0
+            batch_size % group_size == 0
     ), f"Batch size {batch_size} must be divisible by group_size {group_size}"
 
     num_groups = batch_size // group_size
@@ -597,7 +605,7 @@ def compute_grpo_advantages(
 
 
 def compute_grpo_advantages_stable(
-    rewards: torch.Tensor, group_size: int = 4
+        rewards: torch.Tensor, group_size: int = 4
 ) -> torch.Tensor:
     """
     Compute advantages using simple mean-centering (stable fallback).
@@ -614,7 +622,7 @@ def compute_grpo_advantages_stable(
     """
     batch_size = rewards.shape[0]
     assert (
-        batch_size % group_size == 0
+            batch_size % group_size == 0
     ), f"Batch size {batch_size} must be divisible by group_size {group_size}"
 
     num_groups = batch_size // group_size
@@ -631,7 +639,7 @@ def compute_grpo_advantages_stable(
 
 
 def policy_gradient_loss(
-    log_probs: torch.Tensor, advantages: torch.Tensor
+        log_probs: torch.Tensor, advantages: torch.Tensor
 ) -> torch.Tensor:
     """
     Compute policy gradient loss.
@@ -655,14 +663,14 @@ def policy_gradient_loss(
 
 
 def compute_policy_gradient_loss_vllm(
-    model: torch.nn.Module,
-    vllm_token_ids: list[list[int]],
-    vllm_token_log_probs: list[list[float]],
-    prompt_token_ids: list[list[int]],
-    advantages: torch.Tensor,
-    kl_coef: float = 0.1,
-    ppo_clip_eps: float = 0.2,
-    entropy_coef: float = 0.01,
+        model: torch.nn.Module,
+        vllm_token_ids: list[list[int]],
+        vllm_token_log_probs: list[list[float]],
+        prompt_token_ids: list[list[int]],
+        advantages: torch.Tensor,
+        kl_coef: float = 0.1,
+        ppo_clip_eps: float = 0.2,
+        entropy_coef: float = 0.01,
 ) -> tuple[torch.Tensor, dict]:
     """
     Compute PPO policy gradient loss by re-evaluating completions under current policy.
@@ -702,7 +710,7 @@ def compute_policy_gradient_loss_vllm(
     first_sample_deltas = []
 
     for idx, (prompt_toks, gen_toks, vllm_toks_lp) in enumerate(
-        zip(prompt_token_ids, vllm_token_ids, vllm_token_log_probs)
+            zip(prompt_token_ids, vllm_token_ids, vllm_token_log_probs)
     ):
         # Concatenate prompt + generated tokens
         full_sequence = prompt_toks + gen_toks
@@ -710,12 +718,28 @@ def compute_policy_gradient_loss_vllm(
             full_sequence, dtype=torch.long, device=device
         ).unsqueeze(0)
 
-        # Forward pass
-        logits = model(full_tensor)
-        # Use F.log_softmax which is overridden by batch_invariant mode for determinism
-        # Convert to float32 to match vLLM's sampler behavior (use .to() to preserve gradients)
-        log_probs = F.log_softmax(logits[:, :-1, :].to(torch.float32), dim=-1)
-        target_tokens = full_tensor[:, 1:]
+        # full_tensor: [B, seq_len]
+        B, seq_len = full_tensor.shape
+        pad_seq_len = math.ceil(seq_len / 16) * 16
+        pad_len = pad_seq_len - seq_len
+        # padding
+        if pad_len > 0:
+            pad_tensor = torch.zeros((B, pad_len), dtype=torch.long, device=full_tensor.device)  # pad token id=0
+            full_tensor_padded = torch.cat([full_tensor, pad_tensor], dim=1)  # [B, pad_seq_len]
+        else:
+            full_tensor_padded = full_tensor
+
+        # attention mask: 1 表示有效 token，0 表示 padding
+        attention_mask = torch.ones((B, pad_seq_len), dtype=torch.long, device=full_tensor.device)
+        if pad_len > 0:
+            attention_mask[:, :-pad_len] = 0
+
+        # forward pass
+        logits = model(full_tensor_padded, attention_masks=attention_mask)  # [B, pad_seq_len, vocab_size]
+
+        # log softmax
+        log_probs = F.log_softmax(logits[:, :-1 - pad_len, :].to(torch.float32), dim=-1)
+        target_tokens = full_tensor_padded[:, 1:-pad_len]
 
         # Extract log probs for generated tokens only
         prompt_len = len(prompt_toks)
@@ -740,7 +764,7 @@ def compute_policy_gradient_loss_vllm(
             )  # Convert to float32 for display
 
             for token_id, vllm_lp, titan_lp_bf16, titan_lp_f32 in zip(
-                gen_toks, vllm_toks_lp, titan_lps_bf16, titan_lps_f32
+                    gen_toks, vllm_toks_lp, titan_lps_bf16, titan_lps_f32
             ):
                 first_sample_deltas.append(
                     {
@@ -819,20 +843,20 @@ def compute_policy_gradient_loss_vllm(
 
 
 def rl_update_step(
-    model,
-    tokenizer,
-    vllm_engine: VLLMRolloutEngine,
-    prompt_texts: list[str],
-    optimizer: torch.optim.Optimizer,
-    expected_answers: list[str] | None = None,
-    group_size: int = 8,
-    max_new_tokens: int = 20,
-    temperature: float = 1.0,
-    use_vllm_compat: bool = True,
-    num_rollout_batches: int = 1,
-    reward_fn=None,
-    grpo_beta: float = 0.1,
-    use_stable_grpo: bool = False,
+        model,
+        tokenizer,
+        vllm_engine: VLLMRolloutEngine,
+        prompt_texts: list[str],
+        optimizer: torch.optim.Optimizer,
+        expected_answers: list[str] | None = None,
+        group_size: int = 4,
+        max_new_tokens: int = 20,
+        temperature: float = 1.0,
+        use_vllm_compat: bool = True,
+        num_rollout_batches: int = 1,
+        reward_fn=None,
+        grpo_beta: float = 0.1,
+        use_stable_grpo: bool = False,
 ) -> dict:
     """
     Perform one RL update step using vLLM for rollouts.
@@ -875,7 +899,7 @@ def rl_update_step(
     batch_metrics = []
 
     for batch_idx in range(num_rollout_batches):
-        # Generate samples using vLLM
+        # non-distributed fallback: original single-process behaviour
         (
             completions,
             vllm_log_probs,
@@ -1031,8 +1055,8 @@ def main():
     output_dir = "./converted"
 
     # Training config
-    group_size = 8  # Samples per prompt for GRPO (increased from 4)
-    num_rollout_batches = 2  # Multiple rollout batches per update (NEW!)
+    group_size = 4  # Samples per prompt for GRPO (increased from 4)
+    num_rollout_batches = 1  # Multiple rollout batches per update (NEW!)
     num_steps = 100
     learning_rate = 1e-5
 
@@ -1044,7 +1068,7 @@ def main():
 
     # Dataset config
     use_real_dataset = (
-        True  # Set to True to use GSM8K dataset (requires: pip install datasets)
+        False  # Set to True to use GSM8K dataset (requires: pip install datasets)
     )
     num_dataset_samples = 10  # Number of prompts from dataset
 
@@ -1054,20 +1078,19 @@ def main():
     use_vllm_compat = vllm_is_batch_invariant()
 
     if use_vllm_compat:
-        print("✓ Batch invariance detected - using vLLM-compatible model")
-        # Add backward pass support to vLLM's batch_invariant mode
-        print("  Adding gradient support to vLLM's batch_invariant mode...")
-        from torchtitan.experiments.deterministic_vllm_rl.batch_invariant import (
-            enable_batch_invariant_backward_mode,
-        )
+        from patch.patch_vllm_batch_invariant import patch_batch_invariant_kernels
+        from patch.patch_vllm_tp_invariant import patch_unified_triton_attn, patch_kernel_unified_attention_2d
+        patch_batch_invariant_kernels()
+        patch_unified_triton_attn()
+        patch_kernel_unified_attention_2d()
 
-        enable_batch_invariant_backward_mode()
-    else:
-        print("⚠ Batch invariance NOT detected - using standard model")
-        if not use_stable_grpo:
-            print(
-                "  WARNING: Exponential GRPO may be unstable without bitwise invariance!"
-            )
+    #     enable_batch_invariant_backward_mode()
+    # else:
+    #     print("⚠ Batch invariance NOT detected - using standard model")
+    #     if not use_stable_grpo:
+    #         print(
+    #             "  WARNING: Exponential GRPO may be unstable without bitwise invariance!"
+    #         )
 
     # Download and convert model
     print("=" * 80)
@@ -1077,13 +1100,15 @@ def main():
         model_name, cache_dir, output_dir
     )
 
+    # Initialize persistent vLLM engine for rollouts
+    vllm_engine = VLLMRolloutEngine(model_path)
+
     # Load TorchTitan model for training
     print("\nLoading TorchTitan model for training...")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:0" if torch.cuda.is_available() else "cpu")
     model = load_model(
         titan_checkpoint_path, model_path, use_vllm_compat=use_vllm_compat
-    )
-    model = model.to(device)
+    ).to(device)
     model.train()
 
     # Save initial weights for delta computation (on CPU to save GPU memory)
@@ -1091,10 +1116,6 @@ def main():
     initial_state = {
         name: param.clone().cpu() for name, param in model.state_dict().items()
     }
-
-    # Initialize persistent vLLM engine for rollouts
-    print("\nInitializing vLLM engine for rollouts...")
-    vllm_engine = VLLMRolloutEngine(model_path)
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -1219,7 +1240,8 @@ def main():
 
     # Cleanup
     writer.close()
-    del vllm_engine
+    if vllm_engine is not None:
+        del vllm_engine
 
 
 if __name__ == "__main__":

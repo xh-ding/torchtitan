@@ -10,6 +10,10 @@ vLLM-compatible Flash Attention implementation for deterministic RL training.
 
 import torch
 from vllm.vllm_flash_attn import flash_attn_varlen_func
+from torch.autograd import Function
+from flash_attn.flash_attn_interface import _wrapped_flash_attn_backward
+import math
+from typing import Union, Optional
 
 
 class VLLMCompatibleFlashAttention(torch.nn.Module):
@@ -25,12 +29,12 @@ class VLLMCompatibleFlashAttention(torch.nn.Module):
         self.fa_version = get_flash_attn_version()
 
     def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *,
-        scale: float | None = None,
+            self,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            *,
+            scale: float | None = None,
     ) -> torch.Tensor:
         # Flash Attention varlen expects: (batch, seqlen, nheads, headdim)
         # The input from TorchTitan is always (batch, num_heads, seq_len, head_dim)
@@ -60,16 +64,16 @@ class VLLMCompatibleFlashAttention(torch.nn.Module):
         class FlashAttnWithBackward(torch.autograd.Function):
             @staticmethod
             def forward(
-                ctx,
-                q,
-                k,
-                v,
-                cu_seqlens,
-                seq_len,
-                scale,
-                num_splits,
-                flash_fn,
-                fa_version,
+                    ctx,
+                    q,
+                    k,
+                    v,
+                    cu_seqlens,
+                    seq_len,
+                    scale,
+                    num_splits,
+                    flash_fn,
+                    fa_version,
             ):
                 # Call flash attention for forward (fast)
                 output = flash_fn(
@@ -196,21 +200,152 @@ class VLLMCompatibleFlashAttention(torch.nn.Module):
         return output
 
 
+def triton_attention(q, k, v, attention_mask, scale, return_lse=False):
+    device = q.device
+    dtype = q.dtype
+
+    B, S, H, D = q.shape
+
+    block_size = 16
+    batch_size, max_seq_len = attention_mask.shape
+    q_head, kv_head = q.shape[2], k.shape[2]
+    head_dim = q.shape[-1]
+
+    num_blocks_per_batch = math.ceil(max_seq_len / block_size)
+    k_blocks = k.reshape(batch_size, num_blocks_per_batch, block_size, kv_head, head_dim).contiguous()
+    v_blocks = v.reshape(batch_size, num_blocks_per_batch, block_size, kv_head, head_dim).contiguous()
+
+    flatten_query = q.reshape(-1, q_head, head_dim).contiguous()
+    flatten_key = k_blocks.reshape(-1, block_size, kv_head, head_dim).contiguous()
+    flatten_value = v_blocks.reshape(-1, block_size, kv_head, head_dim).contiguous()
+
+    output_triton = torch.zeros_like(flatten_query)
+    lse = None
+    if return_lse:
+        # [num_tokens, head]
+        lse = torch.zeros((B * S, H),
+                          dtype=torch.float32,
+                          requires_grad=False,
+                          device=device
+                          )
+    cu_seq_lens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * max_seq_len
+
+    max_seqlen_q = max_seq_len
+
+    max_seqlen_k = max_seq_len
+
+    seqused_k = torch.full((batch_size,), max_seq_len, dtype=torch.int32, device=device)
+
+    block_table = torch.zeros((batch_size, num_blocks_per_batch), dtype=torch.int32, device=device)
+    block_accumulate = 0
+    for b in range(batch_size):
+        block_count = math.ceil(max_seq_len / block_size)
+
+        block_table[b, :block_count] = torch.arange(block_accumulate, block_accumulate + block_count, dtype=torch.int32,
+                                                    device=device)
+        block_accumulate += num_blocks_per_batch
+
+    from vllm.attention.ops.triton_unified_attention import unified_attention
+    unified_attention(
+        q=flatten_query,
+        k=flatten_key,
+        v=flatten_value,
+        out=output_triton,
+        cu_seqlens_q=cu_seq_lens_q,
+        max_seqlen_q=max_seqlen_q,
+        seqused_k=seqused_k,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_table,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        lse=lse,
+        return_lse=return_lse
+    )
+    output_triton = output_triton.reshape(batch_size, max_seq_len, q_head, head_dim).reshape(batch_size, max_seq_len,
+                                                                                             -1).contiguous()
+    if return_lse:
+        return output_triton, lse
+    return output_triton
+
+
 class VLLMCompatibleTritonAttention(torch.nn.Module):
     """Wrapper around Triton Attention as used by vLLM"""
 
     def __init__(self) -> None:
         super().__init__()
-        pass
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        class TritonAttentionWithBackward(torch.autograd.Function):
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attention_mask: torch.Tensor,
+                scale: float = None) -> torch.Tensor:
+        # print('attention query shape',q.shape)
+        class UnifiedTritonAttentionFunction(Function):
+            """
+            Autograd function for Triton Unified Attention with proper backward support.
+            """
+
             @staticmethod
-            def forward(ctx, q, k, v):
-                pass
+            def forward(
+                    ctx,
+                    q_by_head, k_by_head, v_by_head,
+                    attention_mask,
+                    scale=None
+            ):
+                assert len(q_by_head.shape) == 4, 'Q K V must be 4D tensor [B, L, H, D]'
+                """
+                Forward pass using vLLM's Unified Triton Attention.
+                """
+                B, L, H, D = q_by_head.shape
+                assert L % 16 == 0, f'seq_len must be multiple of 16, current seq_len is {L}.'
+                out, softmax_lse = triton_attention(q_by_head, k_by_head, v_by_head, attention_mask, scale,
+                                                    return_lse=True)
+                # lse should be contiguous and in shape[B, H, L]
+                softmax_lse = softmax_lse.reshape(B, L, H).transpose(1, 2).contiguous()
+                save_out = out.reshape(B, L, H, D).contiguous()
+
+                # Save tensors needed for backward
+                ctx.save_for_backward(q_by_head, k_by_head, v_by_head, save_out, softmax_lse)
+                ctx.softmax_scale = scale
+                ctx.causal = True
+
+                return out
 
             @staticmethod
             def backward(ctx, grad_output):
-                pass
+                """
+                Backward pass using vLLM's FA3 CUDA backward kernel.
+                """
+                q_by_head, k_by_head, v_by_head, out, softmax_lse = ctx.saved_tensors
+                B, L, H, D = q_by_head.shape
 
-        pass
+                grad_output = grad_output.reshape(B, L, H, D).contiguous()
+
+                with torch.inference_mode():
+                    grad_q_by_head = torch.empty_like(q_by_head)
+                    grad_k_by_head = torch.empty_like(k_by_head)
+                    grad_v_by_head = torch.empty_like(v_by_head)
+                    _wrapped_flash_attn_backward(
+                        grad_output,
+                        q_by_head,
+                        k_by_head,
+                        v_by_head,
+                        out,
+                        softmax_lse,
+                        grad_q_by_head,
+                        grad_k_by_head,
+                        grad_v_by_head,
+                        dropout_p=0.,
+                        window_size_left=-1,
+                        window_size_right=-1,
+                        softcap=0.,
+                        alibi_slopes=None,
+                        deterministic=True,
+                        causal=True,
+                        softmax_scale=ctx.softmax_scale,
+                    )
+                return grad_q_by_head, grad_k_by_head, grad_v_by_head, None, None
+
+        return UnifiedTritonAttentionFunction.apply(q, k, v, attention_mask, scale)
