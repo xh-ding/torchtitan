@@ -13,7 +13,6 @@ from vllm.vllm_flash_attn import flash_attn_varlen_func
 from torch.autograd import Function
 from flash_attn.flash_attn_interface import _wrapped_flash_attn_backward
 import math
-from typing import Union, Optional
 
 
 class VLLMCompatibleFlashAttention(torch.nn.Module):

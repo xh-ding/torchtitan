@@ -29,7 +29,7 @@ from torchtitan.experiments.deterministic_vllm_rl.tp_invariant.module import TPI
 
 # RoPE functions (same as original)
 def precompute_rope_cache(
-    dim: int, max_seq_len: int, base: float = 1_000_000.0
+        dim: int, max_seq_len: int, base: float = 1_000_000.0
 ) -> torch.Tensor:
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(max_seq_len, dtype=freqs.dtype, device=freqs.device)
@@ -42,7 +42,7 @@ def precompute_rope_cache(
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
+    x2 = x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
 
 
@@ -58,7 +58,7 @@ def reshape_for_broadcast(rope_cache: torch.Tensor, x: torch.Tensor) -> torch.Te
 
 
 def apply_rotary_emb(
-    xq: torch.Tensor, xk: torch.Tensor, rope_cache: torch.Tensor
+        xq: torch.Tensor, xk: torch.Tensor, rope_cache: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     head_dim = xq.shape[-1]
     rope_cache = reshape_for_broadcast(rope_cache, xq)
@@ -81,7 +81,6 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 
-
 class Attention(nn.Module):
     """
     Multi-head attention module compatible with vLLM.
@@ -97,7 +96,7 @@ class Attention(nn.Module):
         )
         self.n_rep = self.n_heads // self.n_kv_heads
         self.head_dim = model_args.head_dim
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
 
         # QK norm (Qwen3 specific) - use vLLM's RMSNorm
         if model_args.qk_norm:
@@ -113,7 +112,8 @@ class Attention(nn.Module):
         )
         self.wk = nn.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wo = TPInvariantLinearLayer(model_args.n_heads * self.head_dim, model_args.dim, bias=False) if vllm_is_tp_invariant() else nn.Linear(
+        self.wo = TPInvariantLinearLayer(model_args.n_heads * self.head_dim, model_args.dim,
+                                         bias=False) if vllm_is_tp_invariant() else nn.Linear(
             model_args.n_heads * self.head_dim, model_args.dim, bias=False
         )
 
@@ -130,10 +130,10 @@ class Attention(nn.Module):
             self.k_norm.reset_parameters()
 
     def forward(
-        self,
-        x: torch.Tensor,
-        rope_cache: torch.Tensor,
-        attention_masks: AttentionMasksType | None,
+            self,
+            x: torch.Tensor,
+            rope_cache: torch.Tensor,
+            attention_masks: AttentionMasksType | None,
     ):
         bs, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -152,21 +152,7 @@ class Attention(nn.Module):
         # Apply rotary embedding
         xq, xk = apply_rotary_emb(xq, xk, rope_cache)
 
-        # Repeat k/v heads if needed
-        keys = repeat_kv(xk, self.n_rep)
-        values = repeat_kv(xv, self.n_rep)
-
-        # Transpose for attention
-        # xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        # xk = keys.transpose(1, 2)
-        # xv = values.transpose(1, 2)
-
-        # For triton attention, the input shape should be [B, L, H, D]. So, we don't need to transpose qkv.
         output = self.inner_attention(xq, xk, xv, attention_mask=attention_masks, scale=self.scaling)
-        # print('attn output', output.shape)
-        # Transpose back
-        # output = output.transpose(1, 2).contiguous()
-        # output = output.view(bs, seqlen, -1)
 
         return self.wo(output)
 
@@ -197,20 +183,24 @@ class TransformerBlock(nn.Module):
             self.weight_init_std = 0.02 / (2 * model_args.n_layers) ** 0.5
 
     def forward(
-        self,
-        x: torch.Tensor,
-        rope_cache: torch.Tensor,
-        attention_masks: AttentionMasksType | None,
+            self,
+            x: torch.Tensor,
+            rope_cache: torch.Tensor,
+            attention_masks: AttentionMasksType | None,
+            residual: torch.Tensor = None,
     ):
         # Self attention with residual
-        attn_norm_out = self.attention_norm(x)
-        x = x + self.attention(attn_norm_out, rope_cache, attention_masks)
-
+        if residual is None:
+            residual = x
+            x = self.attention_norm(x)
+        else:
+            x, residual = self.attention_norm(x, residual)
+        x = self.attention(x, rope_cache, attention_masks)
         # FFN with residual
-        ffn_norm_out = self.ffn_norm(x)
-        x = x + self.feed_forward(ffn_norm_out)
+        x, residual = self.ffn_norm(x, residual)
+        x = self.feed_forward(x)
 
-        return x
+        return x, residual
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.attention_norm, self.ffn_norm):
@@ -244,8 +234,7 @@ class Qwen3VLLMCompatModel(nn.Module, ModelProtocol):
             self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args)
 
         self.norm = VLLMRMSNorm(model_args.dim, eps=model_args.norm_eps)
-        self.output = TPInvariantLinearLayer(model_args.dim, model_args.vocab_size, bias=False) if vllm_is_tp_invariant() else nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
-
+        self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
         # IMPORTANT: To match vLLM's behavior and Qwen3's config
         # (tie_word_embeddings: true), tie output layer weights to
         # embedding weights. When either weight updates during training,
@@ -253,8 +242,8 @@ class Qwen3VLLMCompatModel(nn.Module, ModelProtocol):
         self.output.weight = self.tok_embeddings.weight
 
     def init_weights(
-        self,
-        buffer_device: torch.device | None = None,
+            self,
+            buffer_device: torch.device | None = None,
     ):
         buffer_device = buffer_device or self.rope_cache.device
         with torch.device(buffer_device):
@@ -266,7 +255,7 @@ class Qwen3VLLMCompatModel(nn.Module, ModelProtocol):
                 layer.init_weights(buffer_device)
         if self.norm is not None:
             self.norm.reset_parameters()
-        final_out_std = self.model_args.dim**-0.5
+        final_out_std = self.model_args.dim ** -0.5
         cutoff_factor = 3
 
         if self.output is not None:
@@ -286,25 +275,26 @@ class Qwen3VLLMCompatModel(nn.Module, ModelProtocol):
         )
 
     def get_attention_masks(
-        self,
-        input_batch: torch.Tensor,
-        tokenizer: BaseTokenizer,
-        extra_inputs: dict[str, torch.Tensor] | None = None,
+            self,
+            input_batch: torch.Tensor,
+            tokenizer: BaseTokenizer,
+            extra_inputs: dict[str, torch.Tensor] | None = None,
     ) -> AttentionMasksType | None:
         # vLLM compat mode: no flex attention masks
         return None
 
     def forward(
-        self,
-        tokens: torch.Tensor,
-        attention_masks: AttentionMasksType | None = None,
+            self,
+            tokens: torch.Tensor,
+            attention_masks: AttentionMasksType | None = None,
     ):
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
+        residual = None
         for layer in self.layers.values():
-            h = layer(h, self.rope_cache, attention_masks)
+            h, residual = layer(h, self.rope_cache, attention_masks, residual)
 
-        h = self.norm(h) if self.norm else h
+        h, _ = self.norm(h, residual) if self.norm else (h, residual)
         output = self.output(h) if self.output else h
 
         return output

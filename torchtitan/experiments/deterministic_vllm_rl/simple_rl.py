@@ -176,6 +176,7 @@ class VLLMRolloutEngine:
                 gpu_memory_utilization=0.3,  # Reduced from 0.5
                 tensor_parallel_size=4,
                 seed=42,  # Fixed seed for determinism
+                enable_prefix_caching=False,
                 enforce_eager=True,
             )
             print("✓ Created new vLLM engine")

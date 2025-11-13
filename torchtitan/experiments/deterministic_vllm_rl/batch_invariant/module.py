@@ -1,7 +1,7 @@
 import torch
 from torch import nn
+from typing import Optional, Union
 from torchtitan.experiments.deterministic_vllm_rl.batch_invariant.batch_invariant_backward import (
-    RMSNormFunction,
     SiluAndMulFunction,
 )
 from torchtitan.experiments.deterministic_vllm_rl.env_utils import vllm_is_tp_invariant
@@ -21,9 +21,31 @@ class VLLMRMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Use vLLM's RMSNorm with gradient support for training
-        return rms_norm_with_gradients(x, self.weight, self.eps)
+    # def forward(self, x: torch.Tensor) -> torch.Tensor:
+    #     # Use vLLM's RMSNorm with gradient support for training
+    #     return rms_norm_with_gradients(x, self.weight, self.eps)
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """PyTorch-native implementation equivalent to forward()."""
+        orig_dtype = x.dtype
+        x = x.to(torch.float32)
+        if residual is not None:
+            x = x + residual.to(torch.float32)
+            residual = x.to(orig_dtype)
+
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+
+        x = x * torch.rsqrt(variance + self.eps)
+        x = x.to(orig_dtype)
+        if self.weight is not None:
+            x = x * self.weight
+        if residual is None:
+            return x
+        else:
+            return x, residual
 
     def reset_parameters(self):
         nn.init.ones_(self.weight)
@@ -65,26 +87,6 @@ class FeedForwardVLLMCompat(nn.Module):
 # ============================================================================
 # Public API for gradient-enabled vLLM operations
 # ============================================================================
-
-
-def rms_norm_with_gradients(
-    input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
-) -> torch.Tensor:
-    """
-    RMS normalization with gradient support.
-
-    Uses vLLM's Triton kernel for forward pass (deterministic) and
-    batch-invariant PyTorch operations for backward pass.
-
-    Args:
-        input: Input tensor [*, hidden_size]
-        weight: Weight tensor [hidden_size]
-        eps: Epsilon for numerical stability
-
-    Returns:
-        output: Normalized and scaled tensor [*, hidden_size]
-    """
-    return RMSNormFunction.apply(input, weight, eps)
 
 
 def silu_and_mul_with_gradients(x: torch.Tensor) -> torch.Tensor:
