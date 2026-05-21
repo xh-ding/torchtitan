@@ -27,15 +27,36 @@ from torchtitan.experiments.deterministic_vllm_rl.env_utils import vllm_is_tp_in
 from torchtitan.experiments.deterministic_vllm_rl.tp_invariant.module import TPInvariantLinearLayer
 
 
-# RoPE functions (same as original)
 def precompute_rope_cache(
-        dim: int, max_seq_len: int, base: float = 1_000_000.0
+    dim: int,
+    max_seq_len: int,
+    base: float = 1_000_000.0,
+    device: torch.device | str = "cuda",
 ) -> torch.Tensor:
-    freqs = 1.0 / (base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(max_seq_len, dtype=freqs.dtype, device=freqs.device)
-    idx_theta = torch.outer(t, freqs).float()
-    freqs = torch.cat([idx_theta, idx_theta], dim=-1)
-    rope_cache = torch.cat([freqs.cos(), freqs.sin()], dim=-1)
+    # Match patched vLLM inv_freq path:
+    # CPU arange -> CPU float -> CPU inv_freq -> move to CUDA
+    inv_freq = 1.0 / (
+        base ** (
+            torch.arange(0, dim, 2, dtype=torch.float, device="cpu") / dim
+        )
+    )
+    inv_freq = inv_freq.to(device)
+
+    # Match patched vLLM later computation device
+    t = torch.arange(
+        max_seq_len,
+        dtype=torch.float,
+        device=inv_freq.device,
+    )
+
+    freqs = torch.einsum("i,j->ij", t, inv_freq)
+
+    # Convert vLLM half layout to rotate_half full layout
+    emb = torch.cat([freqs, freqs], dim=-1)
+
+    # Shape: [max_seq_len, dim * 2]
+    rope_cache = torch.cat([emb.cos(), emb.sin()], dim=-1)
+
     return rope_cache
 
 
